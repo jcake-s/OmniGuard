@@ -81,7 +81,12 @@ pip install -r requirements.txt
 ### 3. Run the Application (Immediate Demo Mode)
 The app runs out-of-the-box with a high-fidelity in-memory demo database and intelligent simulation even before adding API keys:
 ```bash
-streamlit run app.py
+python -m streamlit run app.py
+```
+*Or simply execute the launcher script:*
+```powershell
+.\run.ps1
+# or run.bat
 ```
 
 ### 4. Configure Production Credentials (Optional)
