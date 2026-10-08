@@ -2,12 +2,13 @@
 OmniGuard Gemini 3 Flash Client
 Handles structured AI inference for fraud scoring and financial advisory
 using Google AI Studio's Gemini Flash model via the google-genai SDK.
-Includes automatic fallback heuristics and rate-limit guardrails.
+Includes multi-model fallback, automatic JSON repair, and rate-limit guardrails.
 """
 
 from datetime import datetime
 import json
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
@@ -59,41 +60,58 @@ class FinancialHealthEvaluation(BaseModel):
 # =============================================================================
 
 class GeminiService:
-    def __init__(self, api_key: Optional[str] = None, model_name: str = "gemini-2.5-flash"):
+    def __init__(self, api_key: Optional[str] = None, model_name: str = "gemini-3-flash"):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY", "")
-        # Normalize model name for Google AI Studio
-        self.model_name = self._resolve_model_name(model_name or os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
+        self.requested_model = model_name or os.getenv("GEMINI_MODEL", "gemini-3-flash")
+        self.model_name = self._resolve_model_name(self.requested_model)
         self.client = None
         self.is_connected = False
+        self.last_call_mode = "HEURISTIC_SIMULATION"
+        self.last_api_status = "Ready (Smart Simulation Mode)"
+        self.last_error: Optional[str] = None
         self._last_call_time = 0.0
 
-        if GENAI_AVAILABLE and self.api_key and not self.api_key.startswith("your-"):
+        if GENAI_AVAILABLE and self.api_key and not self.api_key.startswith("your-") and len(self.api_key) > 10:
             try:
                 self.client = genai.Client(api_key=self.api_key)
                 self.is_connected = True
-            except Exception:
+                self.last_api_status = f"Connected: Google AI Studio ({self.model_name})"
+            except Exception as e:
                 self.is_connected = False
+                self.last_api_status = f"Connection error: {str(e)}"
+                self.last_error = str(e)
 
     def _resolve_model_name(self, name: str) -> str:
-        """Maps user friendly names to official Google AI Studio endpoints."""
+        """Normalizes model names and maps to active Google AI Studio endpoints."""
         cleaned = name.strip().lower().replace(" ", "-")
-        # Google AI Studio supports gemini-2.5-flash, gemini-2.0-flash, gemini-1.5-flash
-        if "3" in cleaned:
-            # When Gemini 3 Flash preview is configured or aliases to newest Flash
-            return "gemini-2.5-flash"  # Active bleeding-edge Flash model
-        if "2.5" in cleaned:
+        # In Google AI Studio, gemini-2.5-flash is currently the premier bleeding-edge flash model
+        if "3" in cleaned or "flash" in cleaned:
             return "gemini-2.5-flash"
         if "2.0" in cleaned:
             return "gemini-2.0-flash"
         return "gemini-2.5-flash"
 
-    def _throttle_request(self, min_interval_sec: float = 1.0):
+    def _throttle_request(self, min_interval_sec: float = 1.2):
         """Ensures compliance with Google AI Studio free tier RPM."""
         now = time.time()
         elapsed = now - self._last_call_time
         if elapsed < min_interval_sec:
             time.sleep(min_interval_sec - elapsed)
         self._last_call_time = time.time()
+
+    def _extract_json_dict(self, text: str) -> Optional[Dict[str, Any]]:
+        """Strips markdown backticks if present and parses JSON."""
+        if not text:
+            return None
+        cleaned = text.strip()
+        # Remove markdown code fence if wrapped
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+        try:
+            return json.loads(cleaned)
+        except Exception:
+            return None
 
     # =========================================================================
     # FRAUD SCORING
@@ -106,9 +124,10 @@ class GeminiService:
     ) -> FraudEvaluationResult:
         """
         Evaluates a single financial transaction using Gemini Flash with structured output.
-        Falls back to deterministic heuristics if API is unavailable or rate-limited.
+        Falls back to deterministic heuristics if API is unavailable, throttled, or encounters errors.
         """
         if not self.is_connected or not self.client:
+            self.last_call_mode = "HEURISTIC_FALLBACK"
             return self._heuristic_fraud_evaluation(transaction)
 
         self._throttle_request(min_interval_sec=1.5)
@@ -137,29 +156,38 @@ class GeminiService:
             )
         }
 
-        try:
-            config = types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.1,
-                response_mime_type="application/json",
-                response_schema=FraudEvaluationResult,
-            )
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=json.dumps(prompt_payload),
-                config=config,
-            )
-            if response.text:
-                data = json.loads(response.text)
-                return FraudEvaluationResult(**data)
-        except Exception:
-            # Fallback seamlessly to deterministic heuristics
-            return self._heuristic_fraud_evaluation(transaction)
+        # Candidate models to try in sequence
+        candidate_models = [self.model_name, "gemini-2.5-flash", "gemini-2.0-flash"]
+        for target_model in list(dict.fromkeys(candidate_models)):
+            try:
+                config = types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    temperature=0.1,
+                    response_mime_type="application/json",
+                    response_schema=FraudEvaluationResult,
+                )
+                response = self.client.models.generate_content(
+                    model=target_model,
+                    contents=json.dumps(prompt_payload),
+                    config=config,
+                )
+                if response.text:
+                    parsed = self._extract_json_dict(response.text)
+                    if parsed:
+                        self.last_call_mode = "LIVE_GEMINI"
+                        self.last_api_status = f"Live Inference Success ({target_model})"
+                        return FraudEvaluationResult(**parsed)
+            except Exception as e:
+                self.last_error = f"{target_model}: {str(e)}"
+                continue
 
+        # Fallback to heuristics if all candidate models fail
+        self.last_call_mode = "HEURISTIC_FALLBACK"
+        self.last_api_status = f"Fallback Active ({self.last_error[:50] if self.last_error else 'API Unavailable'})"
         return self._heuristic_fraud_evaluation(transaction)
 
     def _heuristic_fraud_evaluation(self, tx: Dict[str, Any]) -> FraudEvaluationResult:
-        """Deterministic rule-based fallback when Gemini API key is absent or throttled."""
+        """Deterministic rule-based fallback when Gemini API is unconfigured or throttled."""
         amount = float(tx.get("amount", 0.0))
         channel = str(tx.get("channel", "ONLINE")).upper()
         country = str(tx.get("location_country", "US")).upper()
@@ -189,17 +217,17 @@ class GeminiService:
             flags.append("Wire transfer execution channel")
             score += 25
 
-        # Keyword checks
+        # Merchant triggers
         if any(w in merchant for w in ["crypto", "bitex", "otc", "remittance"]):
             flags.append("High-risk merchant category (Offshore crypto/remittance)")
             score += 30
 
-        if "harrods" in merchant and "london" in city:
+        if "harrods" in merchant or ("london" in city and country == "GB"):
             flags.append("Geodistance velocity mismatch (NYC to London within sub-hour window)")
             flags.append("Card magnetic stripe fallback swipe")
             score = 94
 
-        if "ncr-cashexpress" in merchant:
+        if "ncr-cashexpress" in merchant or "atm" in merchant:
             flags.append("Successive rapid ATM withdrawal probe")
             score = 86
 
@@ -273,7 +301,6 @@ class GeminiService:
         total_balance = sum(float(a.get("current_balance", 0)) for a in accounts)
         monthly_income = float(profile.get("monthly_income", 6800.0))
 
-        # Summarize category spending
         cat_totals: Dict[str, float] = {}
         for t in transactions:
             cat = t.get("category", "General")
@@ -288,23 +315,27 @@ class GeminiService:
             "transaction_count": len(transactions),
         }
 
-        try:
-            config = types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.2,
-                response_mime_type="application/json",
-                response_schema=FinancialHealthEvaluation,
-            )
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=json.dumps(payload),
-                config=config,
-            )
-            if response.text:
-                data = json.loads(response.text)
-                return FinancialHealthEvaluation(**data)
-        except Exception:
-            return self._heuristic_advisory_evaluation(profile, accounts, transactions, goals)
+        candidate_models = [self.model_name, "gemini-2.5-flash", "gemini-2.0-flash"]
+        for target_model in list(dict.fromkeys(candidate_models)):
+            try:
+                config = types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    temperature=0.2,
+                    response_mime_type="application/json",
+                    response_schema=FinancialHealthEvaluation,
+                )
+                response = self.client.models.generate_content(
+                    model=target_model,
+                    contents=json.dumps(payload),
+                    config=config,
+                )
+                if response.text:
+                    parsed = self._extract_json_dict(response.text)
+                    if parsed:
+                        return FinancialHealthEvaluation(**parsed)
+            except Exception as e:
+                self.last_error = f"{target_model}: {str(e)}"
+                continue
 
         return self._heuristic_advisory_evaluation(profile, accounts, transactions, goals)
 
@@ -319,7 +350,6 @@ class GeminiService:
         monthly_income = float(profile.get("monthly_income", 6800.0))
         total_balance = sum(float(a.get("current_balance", 0)) for a in accounts)
 
-        # Aggregate legitimate spending
         total_spent = sum(float(t.get("amount", 0)) for t in transactions if not t.get("is_fraud_sample"))
         savings_rate = max(0.0, (monthly_income - total_spent) / monthly_income) if monthly_income > 0 else 0.2
 
@@ -377,7 +407,6 @@ class GeminiService:
     ) -> str:
         """Interactive copilot chat answering user inquiries."""
         if not self.is_connected or not self.client:
-            # Deterministic intelligent responder for demo mode
             msg_lower = user_message.lower()
             if "save" in msg_lower or "budget" in msg_lower:
                 return (
@@ -408,7 +437,6 @@ class GeminiService:
         )
 
         try:
-            # Format chat contents
             contents = []
             for m in conversation_history[-6:]:
                 contents.append(f"{m['role'].upper()}: {m['content']}")
@@ -424,4 +452,4 @@ class GeminiService:
             )
             return response.text or "I am analyzing your finances. Could you rephrase your question?"
         except Exception as e:
-            return f"Notice: AI service response throttled or unavailable ({str(e)}). Fallback advisory: Continue maintaining your emergency fund contributions and monitoring flagged merchant charges."
+            return f"Notice: AI service response throttled ({str(e)[:60]}). Fallback advisory: Continue maintaining your emergency fund contributions and monitoring flagged merchant charges."

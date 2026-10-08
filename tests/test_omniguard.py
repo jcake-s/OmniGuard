@@ -4,6 +4,7 @@ Validates PII masking, Database Service, Gemini Client Fallbacks, and Fraud Engi
 """
 
 import unittest
+import uuid
 from utils.masking import (
     mask_card_number,
     mask_ssn,
@@ -11,7 +12,7 @@ from utils.masking import (
     mask_email,
     sanitize_transaction_payload,
 )
-from utils.mock_data import generate_seed_transactions, get_demo_csv_string
+from utils.mock_data import DEMO_USER_ID, generate_seed_transactions, get_demo_csv_string
 from services.db_service import DatabaseService
 from services.gemini_client import GeminiService
 from services.fraud_engine import FraudEngine
@@ -70,7 +71,7 @@ class TestOmniGuard(unittest.TestCase):
 
     def test_db_service_operations(self):
         profile = self.db.get_profile()
-        self.assertEqual(profile["id"], "usr_demo_8829")
+        self.assertEqual(profile["id"], DEMO_USER_ID)
 
         accounts = self.db.get_accounts()
         self.assertGreaterEqual(len(accounts), 2)
@@ -80,7 +81,7 @@ class TestOmniGuard(unittest.TestCase):
             "amount": 12.00,
             "category": "Dining",
         })
-        self.assertTrue(tx_id.startswith("tx_"))
+        self.assertTrue(uuid.UUID(tx_id))
 
         # Verify retrieval
         txs = self.db.get_transactions(limit=10)

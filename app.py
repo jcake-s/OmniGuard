@@ -69,13 +69,23 @@ st.markdown("""
         font-weight: 600;
         font-size: 0.8rem;
     }
-    /* Card Container */
-    .fin-card {
-        background-color: #1C2541;
-        border: 1px solid #3A4A7A;
-        border-radius: 8px;
-        padding: 18px;
-        margin-bottom: 16px;
+    .source-pill {
+        display: inline-block;
+        padding: 2px 10px;
+        border-radius: 12px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        margin-bottom: 8px;
+    }
+    .source-live {
+        background-color: rgba(0, 229, 255, 0.15);
+        color: #00E5FF;
+        border: 1px solid #00E5FF;
+    }
+    .source-fallback {
+        background-color: rgba(245, 158, 11, 0.15);
+        color: #F59E0B;
+        border: 1px solid #F59E0B;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -85,13 +95,19 @@ st.markdown("""
 # SESSION STATE & SERVICE INITIALIZATION
 # -----------------------------------------------------------------------------
 def get_secret(key: str, default: str = "") -> str:
-    """Safely retrieves keys from st.secrets or os.environ."""
+    """Safely retrieves keys from st.secrets or os.environ case-insensitively."""
+    candidates = [key, key.upper(), key.lower()]
     try:
-        if key in st.secrets:
-            return st.secrets[key]
+        for k in candidates:
+            if k in st.secrets:
+                return str(st.secrets[k]).strip()
     except Exception:
         pass
-    return os.getenv(key, default)
+    for k in candidates:
+        val = os.getenv(k)
+        if val:
+            return val.strip()
+    return default
 
 
 # Initialize Database Service
@@ -145,8 +161,15 @@ with st.sidebar:
     # Supabase Connection Status
     if db.is_connected:
         st.success("🟢 Supabase: Connected (PostgreSQL)")
+        if st.button("📤 Sync Seed Data to Supabase"):
+            with st.spinner("Writing seed transactions to Supabase..."):
+                sync_res = db.sync_seed_data_to_supabase()
+                if sync_res["success"]:
+                    st.success(sync_res["message"])
+                else:
+                    st.error(sync_res["message"])
     else:
-        st.info("🟡 Supabase: In-Memory Demo Mode")
+        st.info(f"🟡 Database: {db.last_db_status}")
 
     # Gemini Flash Status
     if gemini.is_connected:
@@ -156,7 +179,7 @@ with st.sidebar:
 
     # Dynamic API Key Input (No code edits required)
     with st.expander("🔑 API & Cloud Credentials", expanded=False):
-        st.caption("Enter your free Google AI Studio key to activate live Gemini inference:")
+        st.caption("Google AI Studio (Free key at [aistudio.google.com](https://aistudio.google.com)):")
         user_gemini_key = st.text_input(
             "Gemini API Key",
             type="password",
@@ -172,7 +195,8 @@ with st.sidebar:
             st.session_state.gemini_service = GeminiService(api_key=user_gemini_key, model_name=model_choice)
             st.rerun()
 
-        st.caption("Supabase Connection:")
+        st.divider()
+        st.caption("Supabase PostgreSQL (Free tier at [supabase.com](https://supabase.com)):")
         user_supa_url = st.text_input("Supabase URL", value=db.supabase_url or "", placeholder="https://xyz.supabase.co")
         user_supa_key = st.text_input("Supabase Anon Key", type="password", value=db.supabase_key or "", placeholder="eyJhbG...")
         if st.button("Connect Supabase"):
@@ -283,7 +307,7 @@ if nav_selection == "📊 Executive Dashboard":
         for t in flagged_txs:
             fa = t.get("fraud_assessment") or {}
             table_rows.append({
-                "Tx ID": t.get("id"),
+                "Tx ID": str(t.get("id"))[:12] + "...",
                 "Timestamp": str(t.get("transaction_time"))[:19],
                 "Merchant": t.get("merchant_name"),
                 "Amount ($)": f"${float(t.get('amount', 0)):,.2f}",
@@ -374,6 +398,13 @@ elif nav_selection == "🛡️ Fraud Sentinel":
             action = eval_data["recommended_action"]
 
             st.markdown("### 🎯 Assessment Results")
+
+            # Source Pill Indicator
+            if gemini.last_call_mode == "LIVE_GEMINI":
+                st.markdown(f'<span class="source-pill source-live">⚡ Inferred Live via Google AI Studio ({gemini.model_name})</span>', unsafe_allow_html=True)
+            else:
+                st.markdown('<span class="source-pill source-fallback">🛡️ Evaluated via Heuristic Rule Engine (Fallback)</span>', unsafe_allow_html=True)
+
             res_c1, res_c2 = st.columns([1, 2])
 
             with res_c1:
@@ -414,7 +445,7 @@ elif nav_selection == "🛡️ Fraud Sentinel":
                     for ind in eval_data["triggered_indicators"]:
                         st.markdown(f"- 🔴 `{ind}`")
 
-                st.caption(f"Transaction ID `{res['transaction_id']}` saved to financial ledger.")
+                st.caption(f"Transaction ID `{res['transaction_id']}` saved to database.")
 
     # --- BATCH CSV INGESTION ---
     with tab_batch:
@@ -615,7 +646,7 @@ elif nav_selection == "📋 Transaction Ledger & Audit":
             query = search_query.lower()
             m = t.get("merchant_name", "").lower()
             c = t.get("location_city", "").lower()
-            tid = t.get("id", "").lower()
+            tid = str(t.get("id", "")).lower()
             if query not in m and query not in c and query not in tid:
                 continue
         filtered_txs.append(t)
@@ -627,7 +658,7 @@ elif nav_selection == "📋 Transaction Ledger & Audit":
     for t in filtered_txs:
         fa = t.get("fraud_assessment") or {}
         table_data.append({
-            "Tx ID": t.get("id"),
+            "Tx ID": str(t.get("id"))[:12] + "...",
             "Date": str(t.get("transaction_time"))[:16].replace("T", " "),
             "Merchant": t.get("merchant_name"),
             "Category": t.get("category"),
@@ -674,7 +705,7 @@ elif nav_selection == "📋 Transaction Ledger & Audit":
             st.write("")
             if st.button("Apply Decision"):
                 db.update_resolution_status(selected_tx_id, new_status)
-                st.success(f"Transaction `{selected_tx_id}` status updated to `{new_status}`!")
+                st.success(f"Transaction status updated to `{new_status}`!")
                 st.rerun()
     else:
         st.caption("No flagged transactions currently in view to resolve.")
@@ -693,7 +724,7 @@ elif nav_selection == "🚀 Deployment Blueprint":
     with col_d1:
         st.markdown("""
         ### Step 1: GitHub Repository
-        1. Create a repository on GitHub (public or private):
+        1. Initialize your repository:
            ```bash
            git init
            git add .
@@ -702,16 +733,28 @@ elif nav_selection == "🚀 Deployment Blueprint":
            git remote add origin https://github.com/<username>/omniguard.git
            git push -u origin main
            ```
-        2. Ensure `.streamlit/secrets.toml` is in `.gitignore` (never commit API keys!).
+        2. Ensure `.streamlit/secrets.toml` is never committed (it is already in `.gitignore`).
         """)
 
         st.markdown("""
         ### Step 2: Supabase (PostgreSQL) Setup
-        1. Sign up for free at [supabase.com](https://supabase.com).
-        2. Create a new project.
-        3. Navigate to **SQL Editor** and run the DDL script from the documentation.
-        4. In **Project Settings > API**, copy the `Project URL` and `anon public key`.
+        1. Create a free project at [supabase.com](https://supabase.com).
+        2. In **SQL Editor $\rightarrow$ New Query**, copy & paste the contents of `schema.sql` and click **Run**.
+        3. Under **Project Settings $\rightarrow$ API**, copy the `Project URL` and `anon public` key.
         """)
+
+        # Schema Download Button
+        try:
+            with open("schema.sql", "r", encoding="utf-8") as f:
+                schema_content = f.read()
+            st.download_button(
+                label="📥 Download schema.sql for Supabase",
+                data=schema_content,
+                file_name="schema.sql",
+                mime="text/plain"
+            )
+        except Exception:
+            pass
 
     with col_d2:
         st.markdown("""
@@ -725,11 +768,11 @@ elif nav_selection == "🚀 Deployment Blueprint":
         ### Step 4: Streamlit Community Cloud
         1. Go to [share.streamlit.io](https://share.streamlit.io) and link your GitHub account.
         2. Click **Deploy an app**, selecting your repository and `app.py`.
-        3. Under **Advanced settings > Secrets**, paste the following block:
+        3. Under **Advanced settings > Secrets**, paste the following configuration:
         """)
         st.code("""
-GEMINI_API_KEY = "AIzaSy..."
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_API_KEY = "AIzaSyYourActualGoogleKey"
+GEMINI_MODEL = "gemini-3-flash"
 SUPABASE_URL = "https://your-project.supabase.co"
-SUPABASE_KEY = "eyJhbGciOi..."
+SUPABASE_KEY = "eyJhbGciOi...YourAnonKey"
         """, language="toml")
